@@ -48,8 +48,13 @@ _Noreturn extern void fatal(const char* fmt, ...);
 /////////////////////////////////////////////
 // Put your declarations here
 
+int determine_read(int read, int write);
 
+int determine_write(int write, int read);
 
+int min(int a, int b);
+
+void print_open_descriptors(void);
 
 
 #endif // MIMPI_COMMON_H
