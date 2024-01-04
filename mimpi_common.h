@@ -66,6 +66,8 @@ int group_num(int rank, MIMPI_Tree pos);
 
 int min(int a, int b);
 
+int max(int a, int b);
+
 void print_open_descriptors(void);
 
 

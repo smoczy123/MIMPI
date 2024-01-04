@@ -81,6 +81,14 @@ int min(int a, int b) {
     }
 }
 
+int max(int a, int b) {
+    if (a < b) {
+        return b;
+    } else {
+        return a;
+    }
+}
+
 int group_num (int rank, MIMPI_Tree pos) {
     if (pos == MIMPI_Father) {
         return ((rank + 1) / 2) - 1;
