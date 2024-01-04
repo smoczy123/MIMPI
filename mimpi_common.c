@@ -19,7 +19,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define START_FD 900
+#define START_GROUP_FD 800
+#define START_PP_FD 900
 #define MAX_PATH_LENGTH 1024
 
 _Noreturn void syserr(const char* fmt, ...)
@@ -52,16 +53,24 @@ _Noreturn void fatal(const char* fmt, ...)
 /////////////////////////////////////////////////
 // Put your implementation here
 
-int determine_read(int read, int write) {
-    int ret_val = START_FD + 2 * write;
+int determine_read (int read, int write) {
+    int ret_val = START_PP_FD + 2 * write;
     if (write > read) {
         ret_val -= 2;
     }
     return ret_val;
 }
 
-int determine_write(int write, int read) {
+int determine_write (int write, int read) {
     return determine_read(write, read) + 1;
+}
+
+int determine_gread (MIMPI_Tree pos) {
+    return START_GROUP_FD + 2 * pos;
+}
+
+int determine_gwrite (MIMPI_Tree pos) {
+    return START_GROUP_FD + 2 * pos + 1;
 }
 
 int min(int a, int b) {
@@ -71,6 +80,17 @@ int min(int a, int b) {
         return a;
     }
 }
+
+int group_num (int rank, MIMPI_Tree pos) {
+    if (pos == MIMPI_Father) {
+        return ((rank + 1) / 2) - 1;
+    } else if (pos == MIMPI_Left) {
+        return 2 * rank + 1;
+    } else {
+        return 2 * rank + 2;
+    }
+}
+
 
 void print_open_descriptors(void)
 {

@@ -48,9 +48,21 @@ _Noreturn extern void fatal(const char* fmt, ...);
 /////////////////////////////////////////////
 // Put your declarations here
 
+typedef enum {
+    MIMPI_Father = 0,
+    MIMPI_Left = 1,
+    MIMPI_Right = 2
+} MIMPI_Tree;
+
 int determine_read(int read, int write);
 
 int determine_write(int write, int read);
+
+int determine_gread(MIMPI_Tree pos);
+
+int determine_gwrite(MIMPI_Tree pos);
+
+int group_num(int rank, MIMPI_Tree pos);
 
 int min(int a, int b);
 
