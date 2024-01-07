@@ -19,7 +19,7 @@ static unsigned factorial(unsigned n) {
     }
 }
 
-#define DATA_LEN 3
+#define DATA_LEN 2137
 
 int main(int argc, char **argv)
 {
