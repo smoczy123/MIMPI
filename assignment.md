@@ -187,12 +187,12 @@ do zdobycia punktów za efektywną implementację funkcji grupowych.
 
   Wysyła dane zapewnione przez proces o randze `root` do wszystkich pozostałych procesów.
 
-- `MIMPI_Retcode MIMPI_Reduce(const void *send_data_fn, void *recv_data, int count, MPI_Op op, int root)`
+- `MIMPI_Retcode MIMPI_Reduce(const void *send_data, void *recv_data, int count, MPI_Op op, int root)`
 
-  Zbiera dane zapewnione przez wszystkie procesy w `send_data_fn`
+  Zbiera dane zapewnione przez wszystkie procesy w `send_data`
   (traktując je jak tablicę liczb typu `uint8_t` wielkości `count`)
   i przeprowadza na elementach o tych samych indeksach
-  z tablic `send_data_fn` wszystkich procesów (również `root`) redukcję typu `op`.
+  z tablic `send_data` wszystkich procesów (również `root`) redukcję typu `op`.
   Wynik redukcji, czyli tablica typu `uint8_t` wielkości `count`,
   jest zapisywany pod adres `recv_data` **wyłącznie** w procesie o randze `root` (**niedozwolony** jest zapis pod adres `recv_data` w pozostałych procesach).
 
@@ -348,6 +348,7 @@ Szablony do uzupełnienia:
 
 - zbudowanie `mimpirun` i wszystkich przykładów z katalogu `examples/`: `make`
 - uruchomienie lokalnych testów: `./test`
+- uruchomienie lokalnych testów z valgrindem : `VALGRIND=1 ./test`
 - uruchomienie testów według oficjalnego schematu: `./test_on_public_repo`
   
   Powyższa komenda pozwala upewnić się, że rozwiązanie spełnia wymogi techniczne wyszczególnione w [schemacie oceniania](#schemat-oceniania).

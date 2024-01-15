@@ -148,7 +148,7 @@ MIMPI_Retcode MIMPI_Bcast(
 /// @brief Reduces data from all processes to one.
 ///
 /// Performs reduction of kind @ref op over @ref count bytes of data
-/// stored at address @ref send_data_fn in every process. The reduction's result
+/// stored at address @ref send_data in every process. The reduction's result
 /// is put at @ref recv_data *ONLY* in the process with rank @ref root.
 /// Additionally, is a synchronisation point similarly to @ref MIMPI_Barrier.
 ///
