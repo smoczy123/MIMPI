@@ -1,11 +1,9 @@
 /**
  * This file is for implementation of MIMPI library.
  * */
-#include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
@@ -13,8 +11,6 @@
 #include "mimpi.h"
 #include "mimpi_common.h"
 
-#define START_FD 20
-#define START_GROUP_FD 500
 
 struct metadata {
     int count;
@@ -59,7 +55,6 @@ queue_t* new_queue() {
     ret_val->tail = tail_guard;
     return ret_val;
 }
-
 
 void add_node(queue_t* queue, void* data, int count, int tag) {
     node_t* new_node = malloc(sizeof(node_t));
@@ -110,14 +105,90 @@ static void perform_op(void* src1, void* src2, int count, MIMPI_Op op) {
 }
 
 
+
+
+
+static MIMPI_Retcode send_data_fn(int send_fd, int count, void* data) {
+    int sent_bytes;
+    int bytes_to_send = count;
+    while (bytes_to_send != 0) {
+        void* package = malloc(512);
+        memcpy(package, data + count - bytes_to_send, min(bytes_to_send, 512));
+        sent_bytes = chsend(send_fd, package, min(bytes_to_send, 512));
+        if (sent_bytes == -1) {
+            if (errno == EPIPE) {
+                free(package);
+                return MIMPI_ERROR_REMOTE_FINISHED;
+            } else {
+                ASSERT_SYS_OK(-1);
+            }
+        }
+        bytes_to_send -= sent_bytes;
+        free(package);
+    }
+    return MIMPI_SUCCESS;
+}
+
+static MIMPI_Retcode read_data_fn(int read_fd, int count, void* data) {
+    int bytes_left = count;
+    int bytes_read;
+    while (bytes_left != 0) {
+        int msg_size = min(512, bytes_left);
+        ASSERT_SYS_OK(bytes_read = chrecv(read_fd, data + count - bytes_left, msg_size));
+        if (bytes_read == 0) {
+            return MIMPI_ERROR_REMOTE_FINISHED;
+        }
+        bytes_left -= bytes_read;
+    }
+    return MIMPI_SUCCESS;
+}
+
+
 static int size;
 static int rank;
+static bool deadlock_detection;
+static queue_t* deadlock_queues[16];
+static pthread_mutex_t deadlock_mutex[16];
 static bool finished[16];
 static queue_t* queues[16];
 static pthread_t threads[16];
 static pthread_mutex_t queue_mutex[16];
 static pthread_cond_t queue_cond[16];
 
+static MIMPI_Retcode check_deadlock(int destination) {
+
+    node_t* temp_node = queues[destination]->head;
+    while (temp_node->next != NULL) {
+        //printf("checking for deadlock\n");
+        if (temp_node->tag == -1) {
+            //printf("sussy baka\n");
+            metadata_t* meta = temp_node->data;
+            int count = meta->count;
+            int tag = meta->tag;
+            //printf("Waiting for count: %d, tag: %d from %d\n", count, tag, destination);
+            bool found = false;
+            node_t* temp_dnode = deadlock_queues[destination]->head;
+            while (temp_dnode->next != NULL) {
+                if (count == temp_dnode->count && ((tag == temp_dnode->tag) || (tag == 0 && temp_dnode > 0))) {
+                    temp_node = temp_node->next;
+                    remove_node(temp_node->prev);
+                    temp_dnode = temp_dnode->next;
+                    remove_node(temp_dnode->prev);
+                    found = true;
+                    break;
+                }
+                temp_dnode = temp_dnode->next;
+            }
+            if (!found) {
+                return MIMPI_ERROR_DEADLOCK_DETECTED;
+            }
+        } else {
+            temp_node = temp_node->next;
+        }
+    }
+    //printf("all good\n");
+    return MIMPI_SUCCESS;
+}
 
 static void* worker_receiver(void *data) {
     int from = *(int*)data;
@@ -164,20 +235,23 @@ static void* worker_receiver(void *data) {
         ASSERT_ZERO(pthread_mutex_unlock(&queue_mutex[from]));
         pthread_cond_signal(&queue_cond[from]);
     }
-
-
 }
 
 
 
 void MIMPI_Init(bool enable_deadlock_detection) {
     channels_init();
+    deadlock_detection = enable_deadlock_detection;
     ASSERT_SYS_OK(size = strtol(getenv("MIMPI_SIZE"), NULL, 0));
     ASSERT_SYS_OK(rank = strtol(getenv("MIMPI_RANK"), NULL, 0));
     for (int i = 0; i < size; ++i) {
         if (i != rank) {
             finished[i] = false;
             queues[i] = new_queue();
+            if (deadlock_detection) {
+                deadlock_queues[i] = new_queue();
+                ASSERT_ZERO(pthread_mutex_init(&deadlock_mutex[i], NULL));
+            }
             ASSERT_ZERO(pthread_mutex_init(&queue_mutex[i], NULL));
             ASSERT_ZERO(pthread_cond_init(&queue_cond[i], NULL));
             int* num = malloc(sizeof(int));
@@ -191,6 +265,7 @@ void MIMPI_Init(bool enable_deadlock_detection) {
 }
 
 void MIMPI_Finalize() {
+
     if (group_num(rank, MIMPI_Father) >= 0) {
         ASSERT_SYS_OK(close(determine_gwrite(MIMPI_Father)));
         ASSERT_SYS_OK(close(determine_gread(MIMPI_Father)));                }
@@ -207,6 +282,7 @@ void MIMPI_Finalize() {
             ASSERT_SYS_OK(close(determine_write(rank, i)));
         }
     }
+
     for (int i = 0; i < size; ++i) {
         if (i != rank) {
             ASSERT_ZERO(pthread_join(threads[i], NULL));
@@ -214,6 +290,10 @@ void MIMPI_Finalize() {
             ASSERT_ZERO(pthread_cond_destroy(&queue_cond[i]));
             ASSERT_SYS_OK(close(determine_read(rank, i)));
             delete_queue(queues[i]);
+            if (deadlock_detection) {
+                delete_queue(deadlock_queues[i]);
+                ASSERT_ZERO(pthread_mutex_destroy(&deadlock_mutex[i]));
+            }
         }
     }
     channels_finalize();
@@ -266,7 +346,10 @@ MIMPI_Retcode MIMPI_Send(
         }
         bytes_to_send -= sent_bytes;
         free(package);
-
+    }
+    if (deadlock_detection) {
+        int* trash = malloc(sizeof(int));
+        add_node(deadlock_queues[destination], trash, count, tag);
     }
     return MIMPI_SUCCESS;
 }
@@ -284,9 +367,11 @@ MIMPI_Retcode MIMPI_Recv(
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
     bool done = false;
+
     ASSERT_ZERO(pthread_mutex_lock(&queue_mutex[source]));
+    node_t* node = queues[source]->head->next;
+    bool first = true;
     while (!done) {
-        node_t* node = queues[source]->head->next;
         while (node->next != NULL && !done) {
             if ((node->tag == tag || (node->tag > 0 && tag == MIMPI_ANY_TAG)) && node->count == count) {
                 memcpy(data, node->data, count);
@@ -298,11 +383,30 @@ MIMPI_Retcode MIMPI_Recv(
             }
         }
         if (!done) {
+            //printf("checking for deadlock\n");
+            if (deadlock_detection) {
+                if (first) {
+                    //printf("sending deadlock message\n");
+                    metadata_t* metadata = malloc(sizeof(metadata_t));
+                    metadata->count = count;
+                    metadata->tag = tag;
+                    MIMPI_Send(metadata, sizeof(metadata_t), source, -1);
+                    free(metadata);
+                    //printf("deadlock message sent\n");
+                }
+                MIMPI_Retcode retcode = check_deadlock(source);
+                if (retcode == MIMPI_ERROR_DEADLOCK_DETECTED) {
+                    pthread_mutex_unlock(&queue_mutex[source]);
+                    return MIMPI_ERROR_DEADLOCK_DETECTED;
+                }
+            }
             if (finished[source]) {
                 pthread_mutex_unlock(&queue_mutex[source]);
                 return MIMPI_ERROR_REMOTE_FINISHED;
             }
+            node = node->prev;
             pthread_cond_wait(&queue_cond[source], &queue_mutex[source]);
+            first = false;
         }
     }
     ASSERT_ZERO(pthread_mutex_unlock(&queue_mutex[source]));
@@ -311,38 +415,38 @@ MIMPI_Retcode MIMPI_Recv(
 
 MIMPI_Retcode MIMPI_Barrier() {
     void *data = malloc(1);
-    int bytes_read;
+    memset(data, 0, 1);
     if (group_num(rank, MIMPI_Left) < size) {
-        ASSERT_SYS_OK(bytes_read = chrecv( determine_gread(MIMPI_Left), data, 1));
-        if (bytes_read == 0) {
+        if (read_data_fn(determine_gread(MIMPI_Left), 1, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        ASSERT_SYS_OK(bytes_read = chrecv(determine_gread(MIMPI_Right), data, 1));
-        if (bytes_read == 0) {
+        if (read_data_fn(determine_gread(MIMPI_Right), 1, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Father) >= 0) {
-        chsend(determine_gwrite(MIMPI_Father), data, 1);
-        if (errno == EPIPE) {
+        if (send_data_fn(determine_gwrite(MIMPI_Father), 1, data)) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
-        ASSERT_SYS_OK(bytes_read = chrecv(determine_gread(MIMPI_Father), data, 1));
-        if (bytes_read == 0) {
+        if (read_data_fn(determine_gread(MIMPI_Father), 1, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Left) < size) {
-        chsend(determine_gwrite(MIMPI_Left), data, 1);
-        if (errno == EPIPE) {
+        if (send_data_fn(determine_gwrite(MIMPI_Left), 1, data)) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        chsend(determine_gwrite(MIMPI_Right), data, 1);
-        if (errno == EPIPE) {
+        if (send_data_fn(determine_gwrite(MIMPI_Right), 1, data)) {
+            free(data);
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
@@ -368,126 +472,74 @@ MIMPI_Retcode MIMPI_Bcast(
     } else {
         root_path = 1;
     }
-    int bytes_read;
-    int sent_bytes;
-    void* read_data[2];
-    read_data[0] = malloc(count);
-    read_data[1] = malloc(count);
+    void* data_array[2];
+    data_array[0] = malloc(count);
+    data_array[1] = malloc(count);
+    memset(data_array[0], 0, count);
+    memset(data_array[1], 0, count);
     if (group_num(rank, MIMPI_Left) < size) {
-        int bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Left), read_data[0] + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Left), count, data_array[0]) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-        //printf("received %d\n" ,*(short*)read_data[0]);
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        int bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Right), read_data[1] + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Right), count, data_array[1]) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-        //printf("received %d\n" ,*(short*)read_data[1]);
     }
 
-    void* send_data;
+    void* data_to_send;
     if (rank == root) {
-        send_data = data;
+        data_to_send = data;
     } else {
-        send_data = read_data[root_path];
+        data_to_send = data_array[root_path];
     }
     if (group_num(rank, MIMPI_Father) >= 0) {
-        int bytes_left = count;
-        //printf("sent %d\n" ,*(short*)send_data);
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, send_data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Father), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+
+        if (send_data_fn(determine_gwrite(MIMPI_Father), count, data_to_send) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
 
-        bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Father), read_data[root_path] + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Father), count, data_array[root_path]) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-        //printf("received %d\n" ,*(short*)read_data[root_path]);
+        //printf("received %d\n" ,*(short*)data_array[root_path]);
 
     }
 
     if (rank != root) {
-        memcpy(data, read_data[root_path], count);
-        send_data = read_data[root_path];
+        memcpy(data, data_array[root_path], count);
+        data_to_send = data_array[root_path];
     } else {
-        send_data = data;
+        data_to_send = data;
     }
 
 
     if (group_num(rank, MIMPI_Left) < size) {
-        int bytes_left = count;
-        //printf("sent %d\n" ,*(short*)send_data);
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, send_data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Left), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+        if (send_data_fn(determine_gwrite(MIMPI_Left), count, data_to_send) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        int bytes_left = count;
-        //printf("sent %d\n" ,*(short*)send_data);
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, send_data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Right), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+        if (send_data_fn(determine_gwrite(MIMPI_Right), count, data_to_send) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
 
-    free(read_data[0]);
-    free(read_data[1]);
+    free(data_array[0]);
+    free(data_array[1]);
     return MIMPI_SUCCESS;
 
 }
@@ -502,79 +554,47 @@ MIMPI_Retcode MIMPI_Reduce(
     if (root >= size) {
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
-    int bytes_read;
-    int sent_bytes;
     void* data = malloc(count);
     memcpy(data, send_data, count);
-    void* read_data[2];
-    read_data[0] = malloc(count);
-    read_data[1] = malloc(count);
+    void* data_array[2];
+    data_array[0] = malloc(count);
+    memset(data_array[0], 0, count);
+    data_array[1] = malloc(count);
+    memset(data_array[1], 0, count);
     if (group_num(rank, MIMPI_Left) < size) {
-        int bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Left), read_data[0] + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(data);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Left), count, data_array[0]) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-        perform_op(data, read_data[0], count, op);
+        perform_op(data, data_array[0], count, op);
 
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        int bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Right), read_data[1] + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(data);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Right), count, data_array[1]) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-
-        perform_op(data, read_data[1], count, op);
+        perform_op(data, data_array[1], count, op);
     }
 
     if (group_num(rank, MIMPI_Father) >= 0) {
-        int bytes_left = count;
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Father), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(data);
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+        if (send_data_fn(determine_gwrite(MIMPI_Father), count, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
 
-        bytes_left = count;
-        while (bytes_left != 0) {
-            int msg_size = min(512, bytes_left);
-            ASSERT_SYS_OK(bytes_read =
-                    chrecv(determine_gread(MIMPI_Father), data + count - bytes_left, msg_size));
-            if (bytes_read == 0) {
-                free(data);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= bytes_read;
+        if (read_data_fn(determine_gread(MIMPI_Father), count, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
-
     }
 
     if (rank == root) {
@@ -582,43 +602,23 @@ MIMPI_Retcode MIMPI_Reduce(
     }
 
     if (group_num(rank, MIMPI_Left) < size) {
-        int bytes_left = count;
-        //printf("sent %d\n" ,*(short*)send_data);
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Left), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(data);
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+        if (send_data_fn(determine_gwrite(MIMPI_Left), count, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     if (group_num(rank, MIMPI_Right) < size) {
-        int bytes_left = count;
-        //printf("sent %d\n" ,*(short*)send_data);
-        while (bytes_left != 0) {
-            void* package = malloc(512);
-            memcpy(package, data + count - bytes_left, min(bytes_left, 512));
-            sent_bytes = chsend(determine_gwrite(MIMPI_Right), package, min(bytes_left, 512));
-            if (errno == EPIPE) {
-                free(data);
-                free(package);
-                free(read_data[0]);
-                free(read_data[1]);
-                return MIMPI_ERROR_REMOTE_FINISHED;
-            }
-            bytes_left -= sent_bytes;
-            free(package);
+        if (send_data_fn(determine_gwrite(MIMPI_Right), count, data) == MIMPI_ERROR_REMOTE_FINISHED) {
+            free(data);
+            free(data_array[0]);
+            free(data_array[1]);
+            return MIMPI_ERROR_REMOTE_FINISHED;
         }
     }
     free(data);
-    free(read_data[0]);
-    free(read_data[1]);
+    free(data_array[0]);
+    free(data_array[1]);
     return MIMPI_SUCCESS;
 }

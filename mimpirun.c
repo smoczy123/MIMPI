@@ -22,7 +22,6 @@ int main(int argc, char *argv[]) {
     int fd[2];
     int channels_point_point[n][n][2];
     int channels_group[n][n][2];
-
     char num[20];
     sprintf(num, "%ld", n);
     ASSERT_SYS_OK(setenv("MIMPI_SIZE", num, 0));
